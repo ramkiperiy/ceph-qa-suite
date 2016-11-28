@@ -1,41 +1,38 @@
 import logging
 import contextlib
 import time
-
 from teuthology import misc
 from gevent.greenlet import Greenlet
 from gevent.event import Event
 from tasks.cephfs.filesystem import Filesystem
-from teuthology.exceptions import CommandFailedError
 
 log = logging.getLogger(__name__)
 
 '''
     parameters:
 
-    Test runs only in one cephfs mount point.
-
     filesize: Optional Param. Unit in MB, default file size 2MB
               Size of the data file before creating snapshot.
-              Not used if workunit task running in parallel.
+              Not of use if workunit task running in parallel.
 
     runtime: Required Param for using rsync task sequentially. unit in seconds. default 0 sec.
              Don't use this param during parallel execution. if used then finally block will be delayed
 
     data_dir: Optional Param. Specify the client like client.0/client.1
-              make sure cephfs mount and workunit task using this client.
+              make sure cephfs mount and workunit task using this client according to scenario.
               Default source directory will be source/subdir for other scenarios.
 
     snapenable: Optional Param. value in boolean (True or False), default False(disabled).
-                using this option will enable cephfs snapshot and rsync.
+                using this option will enable cephfs snapshot.
 
     waittime: Optional Param. units in seconds. default 5 sec.
               During rsync iteration each loop will wait for specified seconds.
 
-    Note: snapenable and data_dir can't co-exist.
+    mountpoint: Optional param. default it will be first ceph-fuse client id.
+            eg: if there are 3 cephfs clients then for client.0 use 0, client.1 use 1
+            Setting this option will run rsync on this particular client, make sure cephfs mount available.
 
     Examples:
-
     rsync task parallel with another task
     tasks:
       - ceph:
@@ -46,13 +43,26 @@ log = logging.getLogger(__name__)
             filesize: 8
       - cephfs_test_runner:
 
-    rsync task parallel with workunit
+    rsync data from workunit directory in same client.
     tasks:
       - ceph:
       - ceph-fuse: [client.2]
       - rsync:
             waittime: 10
+            mountpoint: 2
             data_dir: client.2
+      - workunit:
+            clients:
+            client.2:
+                - suites/iozone.sh
+
+    rsync task parallel with workunit but on different client
+    tasks:
+      - ceph:
+      - ceph-fuse:
+      - rsync:
+            waittime: 10
+            mountpoint: 1
       - workunit:
             clients:
             client.2:
@@ -64,6 +74,8 @@ log = logging.getLogger(__name__)
       - ceph-fuse:
       - rsync:
             runtime: 120
+            mountpoint: 2
+            snapenable: True
 
 '''
 
@@ -79,27 +91,39 @@ class RSync(Greenlet):
         self.logger = logger
 
         self.my_mnt = None
-        self.workUnit = False
+        self.work_unit = False
 
-        self.runTime = self.config.get('runtime', 0)
-        self.fileSize = self.config.get('filesize', 2)
-        self.waitTime = self.config.get('waittime', 5)
+        self.file_size = self.config.get('filesize', 2)
+        self.wait_time = self.config.get('waittime', 5)
+        self.mount_point = self.config.get('mountpoint')
 
         self.fs = Filesystem(self.ctx)
 
-        self.snapEnable = bool(self.config.get('snapenable', False))
-        self.logger.info('Snapenable param: {}'.format(self.snapEnable))
+        self.snap_enable = bool(self.config.get('snapenable', False))
 
-        if self.config.get('data_dir'):
-            self.workUnit = True
-            self.dataDir = misc.get_testdir(self.ctx)
-            self.sourceDir = self.dataDir + '/workunit.{}/'.format(self.config.get('data_dir'))
+        #Get CephFS mount client and mount object
+        if len(self.ctx.mounts.items()):
+            flag = False
+            for i, j in sorted(self.ctx.mounts.items()):
+                tmp = int(i)
+                if tmp == self.mount_point:
+                    self.mount_point = tmp
+                    self.my_mnt = j
+                if (not self.mount_point) and (not flag):
+                    self.mount_point = tmp
+                    self.my_mnt = j
+                    flag = True
         else:
-            self.snapShot = None
-            self.snapDummy = None
-            self.iteration = 0
-            self.dataDir = 'source'
-            self.sourceDir = self.dataDir + '/subdir'
+            assert len(self.ctx.mounts.items()) > 0, 'No mount available asserting rsync'
+
+        #Set source directory for rsync
+        if self.config.get('data_dir'):
+            self.work_unit = True
+            self.source_dir = misc.get_testdir(self.ctx) + '/mnt.{}'.format(self.mount_point) + \
+                              '/{}/'.format(self.config.get('data_dir'))
+        else:
+            self.data_dir = misc.get_testdir(self.ctx) + '/mnt.{}/'.format(self.mount_point) + 'source'
+            self.source_dir = self.data_dir + '/subdir'
 
     def _run(self):
         try:
@@ -110,87 +134,87 @@ class RSync(Greenlet):
             self.logger.exception("Exception in do_rsync:")
             raise
 
-    def log(self, x):
-        """Write data to logger assigned to this MDThrasher"""
-        self.logger.info(x)
-
     def stop(self):
-        time.sleep(self.runTime)
         self.stopping.set()
 
-    def rsync_io(self):
+    # Function to check directory exists before rsync.
+    def check_if_dir_exists(self, path):
         try:
-            if self.snapEnable:
-                # Rsync snapshot data to rsync directory
-                self.my_mnt.run_shell(["rsync", "-azvh", "{}".format(self.snapShot), "rsyncdir/dir1/"])
-            else:
-                # Rsync data from data directory to rsync directory
-                self.my_mnt.run_shell(["rsync", "-azvh", "{}".format(self.sourceDir), "rsyncdir/dir1/"])
-
-        except CommandFailedError:
-            self.logger.error('rsync command failed asserting rsync')
-            raise
+            self.my_mnt.stat(path)
+            return True
+        except Exception, e :
+            logging.error(e)
+            return False
 
     def do_rsync(self):
 
-        # Get mount objects
-        mounts = [v for k, v in sorted(self.ctx.mounts.items(), lambda a, b: cmp(a[0], b[0]))]
+        iteration = 0
 
-        # Using first mount point of cephfs for run rsync test.
-        if len(mounts):
-            self.my_mnt = mounts.pop(0)
-        else:
-            assert len(mounts) > 0, self.logger.error('No mount available asserting rsync')
-
-        if self.snapEnable:
+        if self.snap_enable:
             # Enable snapshots
             self.fs.mon_manager.raw_cluster_cmd("mds", "set", "allow_new_snaps", "true", "--yes-i-really-mean-it")
-            self.snapDummy = self.dataDir + '/.snap/snap'
 
-        if self.workUnit:
-            assert self.snapEnable == False, \
-                self.logger.error('Workunit task and Snapshot enable cannot co-exist asserting rsync')
-        else:
+        if not self.work_unit:
             # Create a data directory, sub directory and rsync directory
-            self.my_mnt.run_shell(["mkdir", "{}".format(self.dataDir)])
-            self.my_mnt.run_shell(["mkdir", "{}".format(self.sourceDir)])
+            self.my_mnt.run_shell(["mkdir", "{}".format(self.data_dir)])
+            self.my_mnt.run_shell(["mkdir", "{}".format(self.source_dir)])
 
         # Create destination directory
         self.my_mnt.run_shell(["mkdir", "rsyncdir"])
-        self.my_mnt.run_shell(["mkdir", "rsyncdir/dir1"])
 
         while not self.stopping.is_set():
 
-            if self.snapEnable:
-                # Create file and add data to the file
-                self.my_mnt.write_test_pattern("{}/file_a".format(self.sourceDir), self.fileSize * 1024 * 1024)
-                self.snapShot = self.snapDummy + '{}'.format(self.iteration)
+            if not self.check_if_dir_exists(self.source_dir):
+                time.sleep(70) # if source dorectory not exists waiting for 70s and re-trying it
+            elif self.check_if_dir_exists(self.source_dir):
+                pass
+            else:
+                break
+
+            if self.work_unit and self.snap_enable:
+                snap_shot = self.source_dir + '.snap/snap' + '{}'.format(iteration)
 
                 # Create Snapshot
-                self.my_mnt.run_shell(["mkdir", "{}".format(self.snapShot)])
-                self.iteration += 1
+                self.my_mnt.run_shell(["mkdir", "{}".format(snap_shot)])
+                iteration += 1
 
-                self.rsync_io()
+                self.my_mnt.run_shell(["rsync", "-azvh", "{}".format(snap_shot), "rsyncdir/dir1/"])
 
                 # Delete snapshot
-                self.my_mnt.run_shell(["rmdir", "{}".format(self.snapShot)])
+                self.my_mnt.run_shell(["rmdir", "{}".format(snap_shot)])
+
+            elif self.snap_enable:
+                # Create file and add data to the file
+                self.my_mnt.write_test_pattern("{}/file_a".format(self.source_dir), self.file_size * 1024 * 1024)
+                snap_shot = self.data_dir + '/.snap/snap' + '{}'.format(iteration)
+
+                # Create Snapshot
+                self.my_mnt.run_shell(["mkdir", "{}".format(snap_shot)])
+                iteration += 1
+
+                self.my_mnt.run_shell(["rsync", "-azvh", "{}".format(snap_shot), "rsyncdir/dir{}/".format(iteration)])
+
+                # Delete snapshot
+                self.my_mnt.run_shell(["rmdir", "{}".format(snap_shot)])
 
                 # Delete the file created in data directory
-                self.my_mnt.run_shell(["rm", "-f", "{}/file_a".format(self.sourceDir)])
+                self.my_mnt.run_shell(["rm", "-f", "{}/file_a".format(self.source_dir)])
 
-            elif self.workUnit:
-                self.rsync_io()
+            elif self.work_unit:
+                self.my_mnt.run_shell(["rsync", "-azvh", "{}".format(self.source_dir), "rsyncdir/dir1/"])
 
             else:
                 # Create file and add data to the file
-                self.my_mnt.write_test_pattern("{}/file_a".format(self.sourceDir), self.fileSize * 1024 * 1024)
+                self.my_mnt.write_test_pattern("{}/file_a".format(self.source_dir), self.file_size * 1024 * 1024)
 
-                self.rsync_io()
+                self.my_mnt.run_shell(["rsync", "-azvh", "{}".format(self.source_dir), "rsyncdir/dir{}/".format(iteration)])
+                iteration += 1
 
                 # Delete the file created in data directory
-                self.my_mnt.run_shell(["rm", "-f", "{}/file_a".format(self.sourceDir)])
+                self.my_mnt.run_shell(["rm", "-f", "{}/file_a".format(self.source_dir)])
 
-            time.sleep(self.waitTime)
+            time.sleep(self.wait_time)
+
 
 @contextlib.contextmanager
 def task(ctx, config):
@@ -202,6 +226,8 @@ def task(ctx, config):
     assert isinstance(config, dict), \
         "rsync task accepts dict for running configuration"
 
+    run_time = config.get('runtime', 0)
+
     log.info("Create object and start the gevent thread")
     start_rsync = RSync(ctx, config, logger=log.getChild('rsync'))
     start_rsync.start()
@@ -210,6 +236,7 @@ def task(ctx, config):
     try:
         log.debug('Yielding')
         yield
+        time.sleep(run_time)
     finally:
         log.info('joining rsync thread')
         start_rsync_thread.stop()
