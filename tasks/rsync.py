@@ -18,7 +18,8 @@ log = logging.getLogger(__name__)
     runtime: Required Param for using rsync task sequentially. unit in seconds. default 0 sec.
              Don't use this param during parallel execution. if used then finally block will be delayed
 
-    data_dir: Optional Param. Specify the client like client.0/client.1
+    data_dir: Don't use this param if not rsyncing data/snap from workunit data
+              Optional Param. Specify the client like client.0/client.1
               make sure cephfs mount and workunit task using this client according to scenario.
               Default source directory will be source/subdir for other scenarios.
 
@@ -137,8 +138,13 @@ class RSync(Greenlet):
     def stop(self):
         self.stopping.set()
 
-    # Function to check directory exists before rsync.
+    #Function to check directory exists.
     def check_if_dir_exists(self, path):
+        """
+            Call this to check stat of directory.
+            :return: True if directory exists.
+                     False if not.
+        """
         try:
             self.my_mnt.stat(path)
             return True
@@ -149,6 +155,10 @@ class RSync(Greenlet):
     def do_rsync(self):
 
         iteration = 0
+        finished = False
+
+        # Create destination directory
+        self.my_mnt.run_shell(["mkdir", "rsyncdir"])
 
         if self.snap_enable:
             # Enable snapshots
@@ -158,20 +168,24 @@ class RSync(Greenlet):
             # Create a data directory, sub directory and rsync directory
             self.my_mnt.run_shell(["mkdir", "{}".format(self.data_dir)])
             self.my_mnt.run_shell(["mkdir", "{}".format(self.source_dir)])
+            should_stop = False
 
-        # Create destination directory
-        self.my_mnt.run_shell(["mkdir", "rsyncdir"])
+        #Check for source directory exists
+        while not self.check_if_dir_exists(self.source_dir):
+            time.sleep(5) # if source dorectory not exists wait for 5s and poll
+            iteration += 1
+            if iteration > 5:
+                assert self.check_if_dir_exists(self.source_dir), 'assert, source Directory doesnot exists'
 
-        while not self.stopping.is_set():
+        # Start observing the event started by workunit task.
+        if self.work_unit:
+            should_stop = self.ctx.workunit_state.start_observing()
 
-            if not self.check_if_dir_exists(self.source_dir):
-                time.sleep(70) # if source dorectory not exists waiting for 70s and re-trying it
-            elif self.check_if_dir_exists(self.source_dir):
-                pass
-            else:
-                break
+        while not (should_stop or self.stopping.is_set()):
 
+            # rsync data from snapshot. snap is created using workunit IO data
             if self.work_unit and self.snap_enable:
+
                 snap_shot = self.source_dir + '.snap/snap' + '{}'.format(iteration)
 
                 # Create Snapshot
@@ -183,6 +197,10 @@ class RSync(Greenlet):
                 # Delete snapshot
                 self.my_mnt.run_shell(["rmdir", "{}".format(snap_shot)])
 
+                # Check for even handler stop message
+                finished = self.ctx.workunit_state.observer_should_stop()
+
+            # rsync data from snapshot, snap is created using written pattern data
             elif self.snap_enable:
                 # Create file and add data to the file
                 self.my_mnt.write_test_pattern("{}/file_a".format(self.source_dir), self.file_size * 1024 * 1024)
@@ -200,9 +218,13 @@ class RSync(Greenlet):
                 # Delete the file created in data directory
                 self.my_mnt.run_shell(["rm", "-f", "{}/file_a".format(self.source_dir)])
 
+            # rsync data from workunit IO data
             elif self.work_unit:
                 self.my_mnt.run_shell(["rsync", "-azvh", "{}".format(self.source_dir), "rsyncdir/dir1/"])
+                # Check for event handler stop message
+                finished = self.ctx.workunit_state.observer_should_stop()
 
+            # rsync data from written pattern data
             else:
                 # Create file and add data to the file
                 self.my_mnt.write_test_pattern("{}/file_a".format(self.source_dir), self.file_size * 1024 * 1024)
@@ -213,8 +235,11 @@ class RSync(Greenlet):
                 # Delete the file created in data directory
                 self.my_mnt.run_shell(["rm", "-f", "{}/file_a".format(self.source_dir)])
 
-            time.sleep(self.wait_time)
+            # Send back stop request to event handler in workunit task.
+            if finished:
+                self.ctx.workunit_state.stop_observing()
 
+            time.sleep(self.wait_time)
 
 @contextlib.contextmanager
 def task(ctx, config):
