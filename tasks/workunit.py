@@ -6,6 +6,7 @@ import pipes
 import os
 
 from util import get_remote_for_role
+from gevent.event import Event
 
 from teuthology import misc
 from teuthology.config import config as teuth_config
@@ -14,6 +15,110 @@ from teuthology.parallel import parallel
 from teuthology.orchestra import run
 
 log = logging.getLogger(__name__)
+
+
+class WorkunitState(object):
+    """
+    Shared state between the workunit task and any other task that
+    might want to observe and/or interact with the data being created,
+    such as creating snapshots of it or copying it out (like the rsync task).
+
+    Usage from workunit:
+        ctx.workunit_state = WorkunitState()
+        # ... Create my directory
+        ctx.workunit_state.started()
+        # ... Do some long running activity
+        ctx.workunit_state.finished()
+        # ... Remove my directory
+
+    Usage from observer:
+
+        # ... wait until hasattr(ctx, "workunit_state") is true...
+        should_stop = ctx.workunit_state.start_observing()
+        while not should_stop:
+            # ... do some work on the workunit directory, it is
+            #     guaranteed to exist until we call stop_observing...
+            finished = ctx.workunit_state.observer_should_stop()
+        ctx.workunit_state.stop_observing()
+
+    """
+    def __init__(self):
+        # Whether some other task may be acting on this
+        # workunit's directory, such as the rsync task.
+        self.observed = False
+
+        # Whether the workunit has created its directory
+        self.workunit_started = Event()
+
+        # Whether the workunit has removed its directory
+        # at the end of execution
+        self.workunit_finished = Event()
+
+        # Whether the observer has stopped accessing the
+        # workunit's directory (i.e. it is safe to remove it)
+        self.observer_finished = Event()
+
+    def started(self):
+        """
+        Call this from the workunit task when the workunit's directory
+        has been created.  This will tell observers that they may
+        proceed.
+        """
+        assert not self.workunit_started.is_set()
+        self.workunit_started.set()
+
+    def finished(self):
+        """
+        Call this from the workunit task when its work is done but
+        it has not yet deleted its directory.  This will tell observers
+        that they should stop touching the directory, clear out anything
+        they put in it.  This function will block until the observers
+        have done that and indicated so by calling stop_observing.
+        """
+        assert self.workunit_started.is_set()
+        assert not self.workunit_finished.is_set()
+        self.workunit_finished.set()
+        if self.observed:
+            self.observer_finished.wait()
+            self.observed = False
+
+    def start_observing(self):
+        """
+        Call this from the observer thread to start observing.
+
+        :return: True if the workunit already finished (observer should
+                 not touch the workunit dir)
+                 False if the workunit has not finished and the observer
+                 is free to proceed as normal.
+        """
+        assert not self.observed
+        self.workunit_started.wait()
+        finished = self.workunit_finished.is_set():
+        if not finished:
+            self.observed = True
+            self.workunit_finished.is_set()
+
+        return finished
+
+    def stop_observing(self):
+        """
+        Call this from the observer thread after a previous call to
+        start_observing, to indicate to the workunit that it may now
+        tear down its directory.
+        """
+        if not self.observed:
+            return
+
+        self.observed = False
+        self.observer_finished.set()
+
+    def observer_should_stop(self):
+        """
+        Call this from the observer to ask whether it should stop.
+        If this returns true, the observer should stop any access
+        to the workunit directory, and then call stop_observing.
+        """
+        return self.workunit_finished.is_set()
 
 
 def task(ctx, config):
@@ -107,6 +212,12 @@ def task(ctx, config):
         created_mnt_dir = _make_scratch_dir(ctx, role, config.get('subdir'))
         created_mountpoint[role] = created_mnt_dir
 
+    ctx.workunit_state = WorkunitState()
+<<<<<<< HEAD
+    ctx.workunit_state.started()
+=======
+>>>>>>> a2331ed... tasks/workunit: add 'observer' functionality
+
     if 'all' in clients:
         # Execute any 'all' workunits
         all_tasks = clients["all"]
@@ -114,16 +225,30 @@ def task(ctx, config):
                               config.get('subdir'), timeout=timeout)
     else:
         # Execute any non-all workunits
+<<<<<<< HEAD
         with parallel() as p:
             for role, tests in clients.iteritems():
                 if role != "all":
                     p.spawn(_run_tests, ctx, refspec, role, tests,
                             config.get('env'), timeout=timeout)
+=======
+        ctx.workunit_state.started()
+        with parallel() as p:
+            for role, tests in clients.iteritems():
+                p.spawn(_run_tests, ctx, refspec, role, tests,
+                        config.get('env'), timeout=timeout)
+        ctx.workunit_state.finished()
+>>>>>>> a2331ed... tasks/workunit: add 'observer' functionality
 
         # Clean up dirs from any non-all workunits
         for role, created in created_mountpoint.items():
             _delete_dir(ctx, role, created)
 
+<<<<<<< HEAD
+    ctx.workunit_state.finished()
+
+=======
+>>>>>>> a2331ed... tasks/workunit: add 'observer' functionality
 
 def _client_mountpoint(ctx, cluster, id_):
     """
@@ -266,12 +391,22 @@ def _spawn_on_all_clients(ctx, refspec, tests, env, subdir, timeout=None):
                 client_remotes[role] = remote
                 created_mountpoint[role] = _make_scratch_dir(ctx, role, subdir)
 
+<<<<<<< HEAD
+=======
+    ctx.workunit_state.started()
+
+>>>>>>> a2331ed... tasks/workunit: add 'observer' functionality
     for unit in tests:
         with parallel() as p:
             for role, remote in client_remotes.items():
                 p.spawn(_run_tests, ctx, refspec, role, [unit], env, subdir,
                         timeout=timeout)
 
+<<<<<<< HEAD
+=======
+    ctx.workunit_state.finished()
+
+>>>>>>> a2331ed... tasks/workunit: add 'observer' functionality
     # cleanup the generated client directories
     for role, _ in client_remotes.items():
         _delete_dir(ctx, role, created_mountpoint[role])
