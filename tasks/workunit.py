@@ -107,22 +107,22 @@ def task(ctx, config):
         created_mnt_dir = _make_scratch_dir(ctx, role, config.get('subdir'))
         created_mountpoint[role] = created_mnt_dir
 
-    # Execute any non-all workunits
-    with parallel() as p:
-        for role, tests in clients.iteritems():
-            if role != "all":
-                p.spawn(_run_tests, ctx, refspec, role, tests,
-                        config.get('env'), timeout=timeout)
-
-    # Clean up dirs from any non-all workunits
-    for role, created in created_mountpoint.items():
-        _delete_dir(ctx, role, created)
-
-    # Execute any 'all' workunits
     if 'all' in clients:
+        # Execute any 'all' workunits
         all_tasks = clients["all"]
         _spawn_on_all_clients(ctx, refspec, all_tasks, config.get('env'),
                               config.get('subdir'), timeout=timeout)
+    else:
+        # Execute any non-all workunits
+        with parallel() as p:
+            for role, tests in clients.iteritems():
+                if role != "all":
+                    p.spawn(_run_tests, ctx, refspec, role, tests,
+                            config.get('env'), timeout=timeout)
+
+        # Clean up dirs from any non-all workunits
+        for role, created in created_mountpoint.items():
+            _delete_dir(ctx, role, created)
 
 
 def _client_mountpoint(ctx, cluster, id_):
