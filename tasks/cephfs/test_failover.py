@@ -596,8 +596,7 @@ class TestMultiFilesystems(CephFSTestCase):
                           "mds_standby_for_rank", leader_rank)
 
         # Create one fs
-        fs_a = self.mds_cluster.get_filesystem("cephfs")
-        fs_a.create()
+        fs_a = self.mds_cluster.newfs("cephfs")
 
         # Set all the daemons to have a rank assignment but no other
         # standby preferences.
